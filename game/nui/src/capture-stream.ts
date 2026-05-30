@@ -3,28 +3,31 @@ import { CaptureStreamActions } from './types';
 import { Output, WebMOutputFormat, StreamTarget, MediaStreamVideoTrackSource, QUALITY_MEDIUM } from 'mediabunny';
 import type { StreamTargetChunk } from 'mediabunny';
 
-// Each HTTP POST to the FiveM server must stay under 1 MB.
-// 800 KB gives a comfortable margin.
+// 1mb fivem constraint
 const CHUNK_SIZE = 800 * 1024;
 
 type CaptureStreamHttpRequest = {
   action: CaptureStreamActions;
+  captureId?: string;
   uploadToken: string;
   serverEndpoint: string;
   callbackUrl?: never;
   finalizeCallbackUrl?: never;
   maxWidth?: number;
   maxHeight?: number;
+  duration?: number;
 };
 
 type CaptureStreamNuiRequest = {
   action: CaptureStreamActions;
+  captureId?: string;
   uploadToken: string;
   serverEndpoint?: never;
   callbackUrl: string;
   finalizeCallbackUrl: string;
   maxWidth?: number;
   maxHeight?: number;
+  duration?: number;
 };
 
 type CaptureStreamRequest = CaptureStreamHttpRequest | CaptureStreamNuiRequest;
@@ -35,6 +38,9 @@ export class CaptureStream {
   #output: Output | null = null;
   #videoSource: MediaStreamVideoTrackSource | null = null;
   #mediaStream: MediaStream | null = null;
+  #durationTimeout: ReturnType<typeof setTimeout> | null = null;
+  #captureId: string | null = null;
+  #stopping = false;
 
   start() {
     window.addEventListener('message', async (event) => {
@@ -45,6 +51,10 @@ export class CaptureStream {
       }
 
       if (data.action === CaptureStreamActions.Stop) {
+        if (data.captureId && this.#captureId && data.captureId !== this.#captureId) {
+          return;
+        }
+
         await this.stop();
       }
     });
@@ -89,8 +99,16 @@ export class CaptureStream {
   }
 
   async stream(request: CaptureStreamRequest) {
+    if (this.#output || this.#gameView || this.#mediaStream) {
+      console.error('[screencapture] video capture is already active');
+      return;
+    }
+
     const { uploadToken, serverEndpoint, callbackUrl, finalizeCallbackUrl } = request;
     const { width, height } = this.calculateDimensions(request);
+
+    this.#captureId = request.captureId ?? null;
+    this.#stopping = false;
 
     this.#canvas = document.createElement('canvas');
     this.#canvas.width = width;
@@ -99,7 +117,6 @@ export class CaptureStream {
     this.#gameView = createGameView(this.#canvas);
     this.#gameView.resize(width, height);
 
-    // Wait for the FiveM WebGL hook to populate the game framebuffer
     await this.waitForFrames(3);
 
     const writable = callbackUrl
@@ -111,11 +128,6 @@ export class CaptureStream {
       target: new StreamTarget(writable, { chunked: true, chunkSize: CHUNK_SIZE }),
     });
 
-    // canvas.captureStream() is the reliable way to read a desynchronized WebGL
-    // canvas in Chromium. VideoFrame(canvas) can lag or produce empty frames
-    // when the context was created with desynchronized:true, which createGameView
-    // uses. captureStream() routes through the browser's internal compositing
-    // path and always delivers the latest rendered frame.
     this.#mediaStream = this.#canvas.captureStream(30);
     const videoTrack = this.#mediaStream.getVideoTracks()[0];
 
@@ -124,14 +136,20 @@ export class CaptureStream {
       bitrate: QUALITY_MEDIUM,
     });
 
-    // Surface any encoder-level errors so they show up in the NUI console
     this.#videoSource.errorPromise.catch((err) => {
       console.error('[screencapture] video encoder error:', err);
     });
 
     this.#output.addVideoTrack(this.#videoSource);
-    // Frame capture starts automatically once the output is started — no loop needed
     await this.#output.start();
+
+    if (request.duration && request.duration > 0) {
+      this.#durationTimeout = setTimeout(() => {
+        this.stop().catch((err) => {
+          console.error('[screencapture] error stopping stream after duration timeout:', err);
+        });
+      }, request.duration * 1000);
+    }
   }
 
   private createHttpWritableStream(uploadToken: string, serverEndpoint: string): WritableStream<StreamTargetChunk> {
@@ -163,12 +181,10 @@ export class CaptureStream {
   ): WritableStream<StreamTargetChunk> {
     return new WritableStream<StreamTargetChunk>({
       async write(chunk) {
-        // Convert binary chunk to base64 for NUI callback transport
         const bytes = chunk.data instanceof ArrayBuffer
           ? new Uint8Array(chunk.data)
           : new Uint8Array(chunk.data.buffer, chunk.data.byteOffset, chunk.data.byteLength);
 
-        // Build base64 in larger batches for better performance
         const BATCH = 8192;
         const parts: string[] = [];
         for (let i = 0; i < bytes.length; i += BATCH) {
@@ -199,20 +215,25 @@ export class CaptureStream {
   }
 
   async stop() {
-    // Stop all media tracks so no new frames are delivered to the source
+    if (this.#stopping) return;
+    this.#stopping = true;
+
+    if (this.#durationTimeout) {
+      clearTimeout(this.#durationTimeout);
+      this.#durationTimeout = null;
+    }
+
     if (this.#mediaStream) {
       for (const track of this.#mediaStream.getTracks()) {
         track.stop();
       }
     }
 
-    // Signal mediabunny that this track has no more data coming
     if (this.#videoSource) {
       this.#videoSource.close();
     }
 
-    // Flush remaining encoded frames → StreamTarget write() POSTs final chunks
-    // → StreamTarget close() POSTs /stream-finalize to the server
+    // Flush remaining encoded frames
     if (this.#output && this.#output.state === 'started') {
       try {
         await this.#output.finalize();
@@ -234,5 +255,7 @@ export class CaptureStream {
     this.#output = null;
     this.#videoSource = null;
     this.#mediaStream = null;
+    this.#captureId = null;
+    this.#stopping = false;
   }
 }

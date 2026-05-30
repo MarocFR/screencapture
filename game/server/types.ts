@@ -34,6 +34,8 @@ export function createRegularUploadData(
 }
 
 export interface StreamUploadData {
+  captureId: string;
+  token: string;
   source: number;
   tempFilePath: string;
   bytesReceived: number;
@@ -41,7 +43,22 @@ export interface StreamUploadData {
   isRemote: boolean;
   remoteUrl?: string;
   remoteConfig?: StreamRemoteConfig;
+  startedAt: number;
+  duration?: number;
+  legacyCallback?: boolean;
 }
+
+export type VideoCaptureResult = {
+  captureId: string;
+  source: number;
+  status: 'success' | 'error';
+  filePath?: string;
+  response?: unknown;
+  bytesReceived: number;
+  duration?: number;
+  reason?: 'manual' | 'duration' | 'finalized';
+  error?: string;
+};
 
 // Remote upload config specific to video streams.
 export interface StreamRemoteConfig {
@@ -53,12 +70,15 @@ export interface StreamRemoteConfig {
 // Parameters accepted by UploadStore.addStream() — tempFilePath is derived
 // from the generated token so it is not provided by the caller.
 export type AddStreamParams = {
+  captureId: string;
   source: number;
   tempDir: string;
   callback: CallbackFn;
   isRemote?: boolean;
   remoteUrl?: string;
   remoteConfig?: StreamRemoteConfig;
+  duration?: number;
+  legacyCallback?: boolean;
 };
 
 export interface RemoteConfig {
@@ -78,6 +98,7 @@ export interface CaptureOptions {
   encoding?: string;
   maxWidth?: number;
   maxHeight?: number;
+  duration?: number;
 }
 
 export type CallbackFn = (data: unknown, _playerSource?: number, correlationId?: string) => void;
