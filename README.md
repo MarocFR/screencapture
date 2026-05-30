@@ -98,65 +98,100 @@ exports.screencapture.remoteUpload(
 
 > **Experimental.** Video capture is functional but has not been extensively tested across different hardware, FiveM builds, or CEF versions. The API may change. VP9 encoding relies on the WebCodecs API being available in FiveM's bundled Chromium — if encoding silently produces no frames, the resulting file will contain only the container header. Please report any issues.
 
-Video is recorded as WebM (VP9) via the player's NUI. Chunks are streamed to the server as they are produced, assembled on disk, and the callback is fired when the recording is stopped and finalized.
+Video is recorded as WebM (VP9) via the player's NUI. Chunks are streamed to the server as they are produced, assembled on disk, and the callback is fired when the recording is finalized.
 
-Use `INTERNAL_stopServerCaptureStream` to stop an active recording — it works for both `serverCaptureStream` and `remoteUploadStream`.
+Every video capture returns a public `captureId`. Use it to stop the recording, check whether it is active, and correlate callback results. Internal upload tokens are not part of the public API.
 
 ---
 
-### `serverCaptureStream` — server-side export
+### `startVideoCapture` — server-side export
 
-Starts a video recording for a player. When stopped, the assembled WebM file path is passed to the callback. The file lives in `screencapture/tmp/` and the caller is responsible for it.
+Starts a video recording for a player and returns a `captureId`. If `duration` is provided, the recording stops automatically after that many seconds. The callback receives a structured result object when the WebM file is finalized. The file lives in `screencapture/tmp/` and the caller is responsible for it.
 
-| Parameter  | Type       | Description                                              |
-| ---------- | ---------- | -------------------------------------------------------- |
-| `source`   | `number`   | Player source to record                                  |
-| `options`  | `object`   | Capture options (see below)                              |
-| `callback` | `function` | Called with the WebM file path (`string`) when finalized |
+| Parameter  | Type       | Description                              |
+| ---------- | ---------- | ---------------------------------------- |
+| `source`   | `number`   | Player source to record                  |
+| `options`  | `object`   | Capture options (see below)              |
+| `callback` | `function` | Called with the finalized capture result |
 
 #### Options
 
-| Field       | Type     | Default | Description                      |
-| ----------- | -------- | ------- | -------------------------------- |
-| `maxWidth`  | `number` | `1920`  | Maximum capture width in pixels  |
-| `maxHeight` | `number` | `1080`  | Maximum capture height in pixels |
+| Field       | Type     | Default | Description                                      |
+| ----------- | -------- | ------- | ------------------------------------------------ |
+| `duration`  | `number` |         | Optional recording duration in seconds           |
+| `maxWidth`  | `number` | `1920`  | Maximum capture width in pixels                  |
+| `maxHeight` | `number` | `1080`  | Maximum capture height in pixels                 |
 
 ```lua
-exports.screencapture:serverCaptureStream(source, {}, function(filePath)
-    local f = io.open(filePath, 'rb')
-    if f then
-        local size = f:seek('end')
-        f:close()
-        print(('Recorded %d bytes (%.2f MB)'):format(size, size / 1024 / 1024))
+local captureId = exports.screencapture:startVideoCapture(source, {
+    duration = 10,
+    maxWidth = 1280,
+    maxHeight = 720,
+}, function(result)
+    if result.status ~= 'success' then
+        print(('Video capture failed: %s'):format(result.error or 'unknown error'))
+        return
     end
+
+    print(('Capture %s saved to %s'):format(result.captureId, result.filePath))
+    print(('Bytes received: %d'):format(result.bytesReceived or 0))
 end)
+
+print(('Started video capture: %s'):format(captureId))
 ```
 
 ```ts
-exports.screencapture.serverCaptureStream(source, {}, (filePath: string) => {
-  const data = fs.readFileSync(filePath);
-  fs.writeFileSync('./recording.webm', data);
-  fs.unlinkSync(filePath); // clean up the temp file
-});
+const captureId = exports.screencapture.startVideoCapture(
+  source,
+  { duration: 10, maxWidth: 1280, maxHeight: 720 },
+  (result: any) => {
+    if (result.status !== 'success') {
+      console.error('Video capture failed:', result.error);
+      return;
+    }
+
+    console.log(`Capture ${result.captureId} saved to ${result.filePath}`);
+  },
+);
 ```
 
 ---
 
-### `remoteUploadStream` — server-side export
+### `stopVideoCapture` — server-side export
 
-Starts a video recording for a player and uploads the resulting WebM to a remote URL when stopped. The callback receives the remote API's JSON response. The temp file is deleted automatically after upload.
+Stops an active recording by `captureId`. This triggers `output.finalize()` in the NUI, flushes remaining encoded frames, and fires the callback registered by `startVideoCapture` or `startVideoCaptureUpload`.
 
-| Parameter  | Type       | Description                                |
-| ---------- | ---------- | ------------------------------------------ |
-| `source`   | `number`   | Player source to record                    |
-| `url`      | `string`   | Remote upload URL                          |
-| `options`  | `object`   | Upload options (see below)                 |
-| `callback` | `function` | Called with the remote API's JSON response |
+| Parameter   | Type     | Description              |
+| ----------- | -------- | ------------------------ |
+| `captureId` | `string` | Capture ID to stop       |
+
+```lua
+local captureId = exports.screencapture:startVideoCapture(source, {}, function(result)
+    print(result.filePath)
+end)
+
+-- Stop later.
+exports.screencapture:stopVideoCapture(captureId)
+```
+
+---
+
+### `startVideoCaptureUpload` — server-side export
+
+Starts a video recording for a player, uploads the resulting WebM to a remote URL when finalized, deletes the temp file, and returns a `captureId`. The callback receives a structured result object with the remote response.
+
+| Parameter  | Type       | Description                              |
+| ---------- | ---------- | ---------------------------------------- |
+| `source`   | `number`   | Player source to record                  |
+| `url`      | `string`   | Remote upload URL                        |
+| `options`  | `object`   | Upload and capture options               |
+| `callback` | `function` | Called with the finalized capture result |
 
 #### Options
 
 | Field       | Type     | Default       | Description                                     |
 | ----------- | -------- | ------------- | ----------------------------------------------- |
+| `duration`  | `number` |               | Optional recording duration in seconds          |
 | `headers`   | `object` | `{}`          | HTTP headers included in the upload request     |
 | `formField` | `string` | `'file'`      | FormData field name for the uploaded file       |
 | `filename`  | `string` | `'recording'` | File name in the FormData (`.webm` is appended) |
@@ -164,39 +199,44 @@ Starts a video recording for a player and uploads the resulting WebM to a remote
 | `maxHeight` | `number` | `1080`        | Maximum capture height in pixels                |
 
 ```lua
-exports.screencapture:remoteUploadStream(source, 'https://api.fivemanage.com/api/v3/file', {
+local captureId = exports.screencapture:startVideoCaptureUpload(source, 'https://api.fivemanage.com/api/v3/file', {
+    duration = 15,
     headers = { ['Authorization'] = 'your-api-key' },
     filename = 'gameplay',
-}, function(response)
-    print(response.data.url)
-end)
-```
+}, function(result)
+    if result.status ~= 'success' then
+        print(('Upload failed: %s'):format(result.error or 'unknown error'))
+        return
+    end
 
-```ts
-exports.screencapture.remoteUploadStream(
-  source,
-  'https://api.fivemanage.com/api/v3/file',
-  {
-    headers: { Authorization: 'your-api-key' },
-    filename: 'gameplay',
-  },
-  (response: any) => {
-    console.log(response.data.url);
-  },
-);
+    print(('Uploaded capture %s'):format(result.captureId))
+    print(result.response.data.url)
+end)
 ```
 
 ---
 
-### `INTERNAL_stopServerCaptureStream` — server-side export
+### `isVideoCaptureActive` — server-side export
 
-Stops the active recording for a player. Triggers `output.finalize()` in the NUI which flushes remaining encoded frames, then fires the callback registered by `serverCaptureStream` or `remoteUploadStream`.
-
-| Parameter | Type     | Description                           |
-| --------- | -------- | ------------------------------------- |
-| `source`  | `number` | Player source whose recording to stop |
+Returns whether a capture ID is currently active.
 
 ```lua
+if exports.screencapture:isVideoCaptureActive(captureId) then
+    exports.screencapture:stopVideoCapture(captureId)
+end
+```
+
+---
+
+### Compatibility exports
+
+`serverCaptureStream`, `remoteUploadStream`, `INTERNAL_stopServerCaptureStream`, and `stopStream` are still available for existing callers. The stream start exports now return a `captureId`, but their callbacks keep the old payloads: local captures receive the WebM file path, and remote captures receive the remote API response.
+
+```lua
+local captureId = exports.screencapture:serverCaptureStream(source, { duration = 10 }, function(filePath)
+    print(filePath)
+end)
+
 exports.screencapture:INTERNAL_stopServerCaptureStream(source)
 ```
 

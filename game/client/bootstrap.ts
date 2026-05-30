@@ -136,10 +136,11 @@ function createImageCaptureMessage(options: CaptureRequest) {
   });
 }
 
-onNet('screencapture:captureStream', (token: string, options: object) => {
+onNet('screencapture:captureStream', (token: string, options: object, captureId?: string) => {
   if (protocol === 'nui') {
     return SendNUIMessage({
       ...options,
+      captureId,
       uploadToken: token,
       action: 'capture-stream-start',
       callbackUrl: `https://${GetCurrentResourceName()}/capture_stream_chunk`,
@@ -149,14 +150,16 @@ onNet('screencapture:captureStream', (token: string, options: object) => {
 
   SendNUIMessage({
     ...options,
+    captureId,
     uploadToken: token,
     action: 'capture-stream-start',
     serverEndpoint: serverEndpoint,
   });
 });
 
-onNet('screencapture:INTERNAL:stopCaptureStream', () => {
+onNet('screencapture:INTERNAL:stopCaptureStream', (captureId?: string) => {
   SendNUIMessage({
     action: 'capture-stream-stop',
+    captureId,
   });
 });

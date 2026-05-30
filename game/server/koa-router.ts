@@ -9,7 +9,7 @@ import { multer } from './multer';
 
 import FormData from 'form-data';
 import fetch from 'node-fetch';
-import { StreamRemoteConfig, StreamUploadData } from './types';
+import { StreamRemoteConfig, StreamUploadData, VideoCaptureResult } from './types';
 import { UploadStore } from './upload-store';
 import { processUpload } from './process-upload';
 
@@ -19,7 +19,6 @@ const upload = multer({
 
 declare function GetCurrentResourceName(): string;
 
-// Reads the raw request body as a Buffer without any parsing middleware.
 function readRawBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -76,9 +75,6 @@ export async function createServer(uploadStore: UploadStore) {
     }
   });
 
-  // Receive a raw binary chunk and append it to the stream's temp file.
-  // NUI sends chunks sequentially, waiting for a 200 before sending the next,
-  // so the file is assembled in order.
   router.post('/stream-chunk/:token', async (ctx) => {
     const token = ctx.params['token'] as string;
 
@@ -98,10 +94,6 @@ export async function createServer(uploadStore: UploadStore) {
     }
   });
 
-  // Called by NUI after output.finalize() — all chunks have been delivered.
-  // Branches on isRemote:
-  //   remote → read file → upload to URL → delete file → callback(remoteResponse)
-  //   local  → callback(tempFilePath), caller owns the file
   router.post('/stream-finalize/:token', async (ctx) => {
     const token = ctx.params['token'] as string;
 
@@ -125,15 +117,10 @@ export async function createServer(uploadStore: UploadStore) {
   setHttpCallback(app.callback());
 }
 
-// Shared finalization logic used by both the HTTP route and NUI event handler.
-// Branches on isRemote:
-//   remote → read file → upload to URL → delete file → callback(remoteResponse)
-//   local  → callback(tempFilePath), caller owns the file
 export async function finalizeStream(streamData: StreamUploadData): Promise<void> {
+  const elapsedSeconds = Math.round((Date.now() - streamData.startedAt) / 1000);
+
   if (streamData.isRemote) {
-    // Read the assembled file into memory, then immediately delete it —
-    // we do this in a try/finally so the file is always cleaned up even
-    // if the remote upload throws.
     let videoBuffer: Buffer;
     try {
       videoBuffer = await readFile(streamData.tempFilePath);
@@ -143,19 +130,69 @@ export async function finalizeStream(streamData: StreamUploadData): Promise<void
       );
     }
 
-    const response = await uploadStreamFile(streamData.remoteUrl!, streamData.remoteConfig!, videoBuffer!);
+    let response: unknown;
+    try {
+      response = await uploadStreamFile(streamData.remoteUrl!, streamData.remoteConfig!, videoBuffer!);
+    } catch (err) {
+      if (!streamData.legacyCallback) {
+        streamData.callback(createVideoCaptureErrorResult(streamData, err, elapsedSeconds));
+      }
 
-    streamData.callback(response);
+      throw err;
+    }
+
+    if (streamData.legacyCallback) {
+      streamData.callback(response);
+      return;
+    }
+
+    streamData.callback(createVideoCaptureResult(streamData, {
+      response,
+      duration: elapsedSeconds,
+    }));
   } else {
-    // Node.js Buffer → Lua marshaling is broken (Buffer serialises as a
-    // 0-indexed table, giving #data = 0 in Lua). Pass the path string instead.
-    streamData.callback(streamData.tempFilePath);
+    if (streamData.legacyCallback) {
+      streamData.callback(streamData.tempFilePath);
+      return;
+    }
+
+    streamData.callback(createVideoCaptureResult(streamData, {
+      filePath: streamData.tempFilePath,
+      duration: elapsedSeconds,
+    }));
   }
 }
 
-// Uploads a completed WebM video Buffer to a remote URL via multipart FormData.
-// Kept separate from uploadFile() since video always uses video/webm content-type
-// and doesn't need the base64/blob DataType branching that images require.
+function createVideoCaptureErrorResult(
+  streamData: StreamUploadData,
+  err: unknown,
+  duration: number,
+): VideoCaptureResult {
+  return {
+    captureId: streamData.captureId,
+    source: streamData.source,
+    status: 'error',
+    bytesReceived: streamData.bytesReceived,
+    duration,
+    reason: 'finalized',
+    error: err instanceof Error ? err.message : 'An unknown error occurred',
+  };
+}
+
+function createVideoCaptureResult(
+  streamData: StreamUploadData,
+  data: Pick<VideoCaptureResult, 'filePath' | 'response' | 'duration'>,
+): VideoCaptureResult {
+  return {
+    captureId: streamData.captureId,
+    source: streamData.source,
+    status: 'success',
+    bytesReceived: streamData.bytesReceived,
+    reason: 'finalized',
+    ...data,
+  };
+}
+
 async function uploadStreamFile(url: string, config: StreamRemoteConfig, buf: Buffer): Promise<unknown> {
   const formData = new FormData();
   const filename = config.filename ? `${config.filename}.webm` : 'recording.webm';

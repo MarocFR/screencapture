@@ -12,29 +12,110 @@ import {
   createRegularUploadData,
 } from './types';
 import { exportHandler } from './utils';
+import { nanoid } from 'nanoid';
 
-// Temp directory for in-progress video recordings, one .webm file per active stream.
+
 const tempDir = path.join(GetResourcePath(GetCurrentResourceName()), 'tmp');
 mkdir(tempDir, { recursive: true }).catch((err) => {
   console.error('[screencapture] Failed to create temp directory:', err);
 });
 
-// Start a video recording for a specific player source.
-// The callback receives the assembled WebM file path once the recording is stopped.
-global.exports('serverCaptureStream', (source: number, options: CaptureOptions, callback: CallbackFn) => {
-  if (!source) return console.error('[screencapture] source is required for serverCaptureStream');
+function normalizeStreamOptions(options: CaptureOptions = {}, duration?: number): CaptureOptions {
+  return {
+    ...options,
+    ...(duration !== undefined && options.duration === undefined && { duration }),
+  };
+}
+
+function validateStreamRequest(source: number, options: CaptureOptions, exportName: string): boolean {
+  if (!source) {
+    console.error(`[screencapture] source is required for ${exportName}`);
+    return false;
+  }
+
+  if (options.duration !== undefined && (!Number.isFinite(options.duration) || options.duration <= 0)) {
+    console.error(`[screencapture] duration must be a positive number for ${exportName}`);
+    return false;
+  }
+
+  if (uploadStore.hasActiveStreamForSource(source)) {
+    console.error(`[screencapture] source ${source} already has an active video capture`);
+    return false;
+  }
+
+  return true;
+}
+
+function startVideoCapture(
+  source: number,
+  options: CaptureOptions = {},
+  callback: CallbackFn = () => {},
+  legacyCallback = false,
+): string | undefined {
+  if (!validateStreamRequest(source, options, legacyCallback ? 'serverCaptureStream' : 'startVideoCapture')) return;
+
+  const captureId = nanoid(24);
+  console.log(`[screencapture] Starting video capture for source ${source} with capture ID ${captureId}`);
 
   const token = uploadStore.addStream({
+    captureId,
     source,
     tempDir,
-    callback: callback ?? (() => {}),
+    callback,
+    duration: options.duration,
+    legacyCallback,
   });
 
-  emitNet('screencapture:captureStream', source, token, options ?? {});
+  emitNet('screencapture:captureStream', source, token, options, captureId);
+
+  return captureId;
+}
+
+function startVideoCaptureUpload(
+  source: number,
+  url: string,
+  options: StreamRemoteConfig & Pick<CaptureOptions, 'maxWidth' | 'maxHeight' | 'duration'> = {},
+  callback: CallbackFn = () => {},
+  legacyCallback = false,
+): string | undefined {
+  if (!url) {
+    console.error(`[screencapture] url is required for ${legacyCallback ? 'remoteUploadStream' : 'startVideoCaptureUpload'}`);
+    return;
+  }
+
+  if (!validateStreamRequest(source, options, legacyCallback ? 'remoteUploadStream' : 'startVideoCaptureUpload')) return;
+
+  const captureId = nanoid(24);
+  console.log(`[screencapture] Starting remote video capture for source ${source} with capture ID ${captureId}`);
+
+  const token = uploadStore.addStream({
+    captureId,
+    source,
+    tempDir,
+    callback,
+    duration: options.duration,
+    isRemote: true,
+    remoteUrl: url,
+    remoteConfig: {
+      headers: options?.headers,
+      formField: options?.formField,
+      filename: options?.filename,
+    },
+    legacyCallback,
+  });
+
+  emitNet('screencapture:captureStream', source, token, options, captureId);
+
+  return captureId;
+}
+
+global.exports('startVideoCapture', startVideoCapture);
+global.exports('startVideoCaptureUpload', startVideoCaptureUpload);
+global.exports('serverCaptureStream', (source: number, options: CaptureOptions, callback: CallbackFn, duration?: number) => {
+  return startVideoCapture(source, normalizeStreamOptions(options ?? {}, duration), callback ?? (() => {}), true);
 });
 
-// Record a video and upload it to a remote URL once stopped.
-// The callback receives the remote API's JSON response.
+
 global.exports(
   'remoteUploadStream',
   (
@@ -42,32 +123,42 @@ global.exports(
     url: string,
     options: StreamRemoteConfig & Pick<CaptureOptions, 'maxWidth' | 'maxHeight'>,
     callback: CallbackFn,
+    duration?: number,
   ) => {
-    if (!source) return console.error('[screencapture] source is required for remoteUploadStream');
-    if (!url) return console.error('[screencapture] url is required for remoteUploadStream');
-
-    const token = uploadStore.addStream({
-      source,
-      tempDir,
-      callback: callback ?? (() => {}),
-      isRemote: true,
-      remoteUrl: url,
-      remoteConfig: {
-        headers: options?.headers,
-        formField: options?.formField,
-        filename: options?.filename,
-      },
-    });
-
-    emitNet('screencapture:captureStream', source, token, options ?? {});
+    return startVideoCaptureUpload(source, url, normalizeStreamOptions(options ?? {}, duration), callback ?? (() => {}), true);
   },
 );
 
-// Stop the active recording for a specific player source.
-// The NUI will call output.finalize() which triggers the /stream-finalize
-// endpoint, assembles the file, and fires the callback.
+global.exports('stopVideoCapture', (captureId: string) => {
+  if (!captureId) return console.error('[screencapture] captureId is required for stopVideoCapture');
+
+  try {
+    const streamData = uploadStore.getStreamByCaptureId(captureId);
+    emitNet('screencapture:INTERNAL:stopCaptureStream', streamData.source, captureId);
+  } catch (err) {
+    console.error('[screencapture] stopVideoCapture failed:', err);
+  }
+});
+
+global.exports('isVideoCaptureActive', (captureId: string) => {
+  if (!captureId) return false;
+
+  try {
+    uploadStore.getStreamByCaptureId(captureId);
+    return true;
+  } catch {
+    return false;
+  }
+});
+
 global.exports('INTERNAL_stopServerCaptureStream', (source: number) => {
-  emitNet('screencapture:INTERNAL:stopCaptureStream', source);
+  const captureId = uploadStore.getCaptureIdBySource(source);
+  emitNet('screencapture:INTERNAL:stopCaptureStream', source, captureId);
+});
+
+global.exports('stopStream', (source: number) => {  
+  const captureId = uploadStore.getCaptureIdBySource(source);
+  emitNet('screencapture:INTERNAL:stopCaptureStream', source, captureId); 
 });
 
 global.exports(
