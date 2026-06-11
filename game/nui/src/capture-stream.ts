@@ -98,6 +98,17 @@ export class CaptureStream {
     });
   }
 
+  private async assertCallbackResponse(response: Response, context: string): Promise<void> {
+    if (!response.ok) {
+      throw new Error(`${context} failed: ${response.status}`);
+    }
+
+    const result = await response.json().catch(() => true);
+    if (result && typeof result === 'object' && 'ok' in result && !result.ok) {
+      throw new Error(`${context} failed: ${result.error ?? 'Unknown error'}`);
+    }
+  }
+
   async stream(request: CaptureStreamRequest) {
     if (this.#output || this.#gameView || this.#mediaStream) {
       console.error('[screencapture] video capture is already active');
@@ -179,6 +190,8 @@ export class CaptureStream {
     callbackUrl: string,
     finalizeCallbackUrl: string,
   ): WritableStream<StreamTargetChunk> {
+    const assertCallbackResponse = this.assertCallbackResponse.bind(this);
+
     return new WritableStream<StreamTargetChunk>({
       async write(chunk) {
         const bytes = chunk.data instanceof ArrayBuffer
@@ -199,17 +212,17 @@ export class CaptureStream {
           headers: { 'Content-Type': 'application/json' },
         });
 
-        if (!response.ok) {
-          throw new Error(`NUI chunk callback failed: ${response.status}`);
-        }
+        await assertCallbackResponse(response, 'NUI chunk callback');
       },
 
       async close() {
-        await fetch(finalizeCallbackUrl, {
+        const response = await fetch(finalizeCallbackUrl, {
           method: 'POST',
           body: JSON.stringify({ token: uploadToken }),
           headers: { 'Content-Type': 'application/json' },
         });
+
+        await assertCallbackResponse(response, 'NUI finalize callback');
       },
     });
   }
